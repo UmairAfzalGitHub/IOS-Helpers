@@ -4,7 +4,7 @@ import UIKit
 
 public extension UITableView {
     
-    func register<T: UITableViewCell>(_: T.Type, indexPath: IndexPath) {
+    func register<T: UITableViewCell>(_: T.Type) {
         self.register(UINib(nibName: String(describing: T.self), bundle: .main), forCellReuseIdentifier: String(describing: T.self))
     }
     
