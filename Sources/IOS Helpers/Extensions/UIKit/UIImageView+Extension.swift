@@ -4,12 +4,12 @@ import UIKit
 
 public extension UIImageView {
     
-    func setupActivityIndicator() {
+    func setupActivityIndicator(color: UIColor = .red) {
         // Check if the activity indicator already exists
         if self.viewWithTag(6565) != nil { return }
         
         let activityIndicator = UIActivityIndicatorView(style: .large)
-        activityIndicator.color = Colors.Demin
+        activityIndicator.color = color
         activityIndicator.tag = 6565
         activityIndicator.translatesAutoresizingMaskIntoConstraints = false
         activityIndicator.startAnimating()

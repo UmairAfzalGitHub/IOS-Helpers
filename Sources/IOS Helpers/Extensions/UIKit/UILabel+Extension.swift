@@ -21,19 +21,4 @@ public extension UILabel {
         
         self.attributedText = attributedString
     }
-    
-    func setScreenHeadingLabel(text: String) {
-        self.text = text
-        font = UIFont.appThemeSemiBoldFontWithSize(32)
-        textColor = Colors.BlueZodiac
-        setLineHeight(48)
-    }
-    
-    func setScreenSubHeadingLabel(text: String) {
-        self.numberOfLines = 0
-        self.text = text
-        font = UIFont.appThemeFontWithSize(16)
-        textColor = Colors.BrightGrey
-        setLineHeight(24)
-    }
 }
