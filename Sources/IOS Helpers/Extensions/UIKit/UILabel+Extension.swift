@@ -1,9 +1,3 @@
-//
-//  UILabel.swift
-//  ICON
-//
-//  Created by Huzaifa-Umer on 30/10/2024.
-//
 
 import UIKit
 

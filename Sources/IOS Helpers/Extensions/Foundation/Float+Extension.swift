@@ -1,9 +1,3 @@
-//
-//  Float.swift
-//  ICON
-//
-//  Created by Osama Usmani on 17/12/2024.
-//
 
 import Foundation
 
