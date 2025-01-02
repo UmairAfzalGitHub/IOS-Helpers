@@ -44,6 +44,22 @@ public extension UIImage {
         self.init(cgImage: image.cgImage!)
     }
     
+    convenience init?(unicode: String, fontSize: CGFloat = 30) {
+        let label = UILabel()
+        label.text = unicode
+        label.font = UIFont.systemFont(ofSize: fontSize)
+        label.sizeToFit()
+        
+        // Create a UIGraphicsImageRenderer to capture the UILabel as an image
+        let renderer = UIGraphicsImageRenderer(size: label.bounds.size)
+        let image = renderer.image { context in
+            // Render the UILabel into the current graphics context
+            label.layer.render(in: context.cgContext)
+        }
+                
+        self.init(cgImage: image.cgImage!)
+    }
+    
     func transform(withNewColor color: UIColor) -> UIImage {
         UIGraphicsBeginImageContextWithOptions(size, false, scale)
         
