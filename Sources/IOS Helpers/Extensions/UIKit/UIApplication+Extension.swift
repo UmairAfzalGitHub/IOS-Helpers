@@ -54,4 +54,31 @@ public extension UIApplication {
         }
         return nil
     }
+    
+    func updateRootViewController(
+          to viewController: UIViewController,
+          animated: Bool = true
+      ) {
+          guard let window = connectedScenes
+                  .filter({ $0.activationState == .foregroundActive })
+                  .compactMap({ $0 as? UIWindowScene })
+                  .first?.windows.first(where: { $0.isKeyWindow }) else {
+              print("No key window found.")
+              return
+          }
+          
+          if animated {
+              let snapshot = window.snapshotView(afterScreenUpdates: true)
+              viewController.view.addSubview(snapshot ?? UIView())
+              window.rootViewController = viewController
+              
+              UIView.animate(withDuration: 0.3, animations: {
+                  snapshot?.alpha = 0
+              }, completion: { _ in
+                  snapshot?.removeFromSuperview()
+              })
+          } else {
+              window.rootViewController = viewController
+          }
+      }
 }
