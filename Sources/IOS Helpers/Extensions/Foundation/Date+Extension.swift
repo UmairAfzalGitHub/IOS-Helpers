@@ -55,6 +55,14 @@ public extension Date {
         return Calendar.current.dateComponents([.second], from: date, to: self).second ?? 0
     }
     
+    func interval(of component: Calendar.Component, from date: Date) -> Int {
+        let calendar = Calendar.current
+        guard let start = calendar.ordinality(of: component, in: .era, for: date) else { return 0 }
+        guard let end = calendar.ordinality(of: component, in: .era, for: self) else { return 0 }
+        
+        return end - start
+    }
+    
     /// Returns the a custom time interval description from another date
     func offset(from date: Date) -> String {
         if years(from: date)   > 0 { return "\(years(from: date))y"   }
