@@ -159,4 +159,20 @@ public extension UIView {
             completion(true)
         }
     }
+    
+    func pinToSuperviewEdges(margin: CGFloat = 0) {
+          guard let superview = self.superview else {
+              print("Superview is nil, unable to pin view to edges")
+              return
+          }
+
+          translatesAutoresizingMaskIntoConstraints = false
+
+          NSLayoutConstraint.activate([
+              topAnchor.constraint(equalTo: superview.topAnchor, constant: margin),
+              bottomAnchor.constraint(equalTo: superview.bottomAnchor, constant: -margin),
+              leadingAnchor.constraint(equalTo: superview.leadingAnchor, constant: margin),
+              trailingAnchor.constraint(equalTo: superview.trailingAnchor, constant: -margin)
+          ])
+      }
 }
