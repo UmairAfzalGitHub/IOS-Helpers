@@ -112,4 +112,16 @@ public extension UITextField {
         self.leftViewMode = .always
     }
     
+    func setPlaceHolder(text : String,
+                        color : UIColor = .white,
+                        font : UIFont? = .systemFont(ofSize: 17)
+    ){
+        self.attributedPlaceholder = NSAttributedString(
+           string: "\(text)",
+           attributes: [
+            NSAttributedString.Key.foregroundColor: color,
+            NSAttributedString.Key.font : font ?? .systemFont(ofSize: 17)
+           ]
+       )
+    }
 }
