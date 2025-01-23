@@ -7,21 +7,21 @@
 
 import UIKit
 
-class CircularProgressView: UIView {
+public class CircularProgressView: UIView {
 
     private let backgroundLayer = CAShapeLayer()
     private let progressLayer = CAShapeLayer()
 
     // MARK: - Public Properties
-    var backgroundArcColor: UIColor = .white {
+    public var backgroundArcColor: UIColor = .white {
         didSet { backgroundLayer.strokeColor = backgroundArcColor.cgColor }
     }
 
-    var progressArcColor: UIColor = .red {
+    public var progressArcColor: UIColor = .red {
         didSet { progressLayer.strokeColor = progressArcColor.cgColor }
     }
 
-    var arcLineWidth: CGFloat = 15 {
+    public var arcLineWidth: CGFloat = 15 {
         didSet {
             backgroundLayer.lineWidth = arcLineWidth
             progressLayer.lineWidth = arcLineWidth
@@ -76,7 +76,7 @@ class CircularProgressView: UIView {
     }
 
     // MARK: - Public Methods
-    func setProgress(_ progress: CGFloat, animated: Bool) {
+    public func setProgress(_ progress: CGFloat, animated: Bool) {
         let clampedProgress = max(0, min(progress, 1)) // Ensure the progress is between 0 and 1
         progressLayer.strokeEnd = clampedProgress
 
@@ -89,7 +89,7 @@ class CircularProgressView: UIView {
         }
     }
 
-    func resetProgress(animated: Bool) {
+    public func resetProgress(animated: Bool) {
         if animated {
             let animation = CABasicAnimation(keyPath: "strokeEnd")
             animation.fromValue = progressLayer.presentation()?.strokeEnd ?? progressLayer.strokeEnd
