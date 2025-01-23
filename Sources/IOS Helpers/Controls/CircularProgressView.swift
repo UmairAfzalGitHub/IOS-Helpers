@@ -59,7 +59,7 @@ public class CircularProgressView: UIView {
     }
 
     // MARK: - Layout
-    override func layoutSubviews() {
+    public override func layoutSubviews() {
         super.layoutSubviews()
 
         // Define the arc's path
