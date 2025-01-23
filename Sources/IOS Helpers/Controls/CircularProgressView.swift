@@ -14,21 +14,30 @@ public class CircularProgressView: UIView {
 
     // MARK: - Public Properties
     public var backgroundArcColor: UIColor = .white {
-        didSet { backgroundLayer.strokeColor = backgroundArcColor.cgColor }
+        didSet {
+            DispatchQueue.main.async {
+                self.backgroundLayer.strokeColor = self.backgroundArcColor.cgColor
+            }
+        }
     }
 
     public var progressArcColor: UIColor = .red {
-        didSet { progressLayer.strokeColor = progressArcColor.cgColor }
+        didSet {
+            DispatchQueue.main.async {
+                self.progressLayer.strokeColor = self.progressArcColor.cgColor
+            }
+        }
     }
 
     public var arcLineWidth: CGFloat = 15 {
         didSet {
-            backgroundLayer.lineWidth = arcLineWidth
-            progressLayer.lineWidth = arcLineWidth
-            setNeedsLayout()
+            DispatchQueue.main.async {
+                self.backgroundLayer.lineWidth = self.arcLineWidth
+                self.progressLayer.lineWidth = self.arcLineWidth
+                self.setNeedsLayout()
+            }
         }
     }
-
 
     // MARK: - Initializers
     override init(frame: CGRect) {
