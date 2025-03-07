@@ -66,6 +66,45 @@ public extension UIViewController {
     @objc func dismissViewControllerOnTap(gesture: UIGestureRecognizer) {
         self.dismiss(animated: true, completion: nil)
     }
+    
+    func showAlert(title: String,
+                   message: String,
+                   completion: (() -> Void)? = nil) {
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
+            completion?()
+        })
+        self.present(alert, animated: true)
+    }
+    
+    // getting top view controller currently visible
+    func topViewController() -> UIViewController {
+        
+        if let presented = self.presentedViewController {
+            return presented.topViewController()
+        }
+        
+        if let navigation = self as? UINavigationController {
+            return navigation.visibleViewController?.topViewController() ?? navigation
+        }
+        
+        if let tab = self as? UITabBarController {
+            return tab.selectedViewController?.topViewController() ?? tab
+        }
+        
+        return self
+    }
+
+    /// To get the topMost visible viewController
+    ///
+    /// - returns:  An optional top most viewController of the application
+    static func topMostController() -> UIViewController? {
+        var topController: UIViewController? = UIApplication.shared.sceneWindow?.rootViewController
+        while ((topController?.presentedViewController) != nil) {
+            topController = topController?.presentedViewController
+        }
+        return topController
+    }
 }
 
 extension UIViewController: UIGestureRecognizerDelegate {

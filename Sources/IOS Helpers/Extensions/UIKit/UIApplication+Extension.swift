@@ -81,4 +81,21 @@ public extension UIApplication {
               window.rootViewController = viewController
           }
       }
+    
+    var sceneWindow: UIWindow? {
+        guard let windowScene = connectedScenes.first as? UIWindowScene,
+              let keyWindow = windowScene.windows.first(where: { $0.isKeyWindow }) else {
+            return nil
+        }
+
+        return keyWindow
+    }
+    
+    var topViewController: UIViewController? {
+        guard let windowScene = connectedScenes.first as? UIWindowScene,
+              let keyWindow = windowScene.windows.first(where: { $0.isKeyWindow }) else {
+            return nil
+        }
+        return keyWindow.rootViewController?.topViewController()
+    }
 }
