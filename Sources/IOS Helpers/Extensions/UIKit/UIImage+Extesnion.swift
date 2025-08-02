@@ -91,6 +91,25 @@ public extension UIImage {
         return self.jpegData(compressionQuality: quality.rawValue)
     }
     
+    func overlayWithGradient(colors: [UIColor], startPoint: CGPoint = CGPoint(x: 0.5, y: 0.38), endPoint: CGPoint = CGPoint(x: 0.5, y: 1)) -> UIImage {
+        let gradientLayer = CAGradientLayer()
+        gradientLayer.frame = CGRect(origin: .zero, size: size)
+        gradientLayer.colors = colors.map { $0.cgColor }
+        gradientLayer.startPoint = startPoint
+        gradientLayer.endPoint = endPoint
+        
+        UIGraphicsBeginImageContextWithOptions(size, false, scale)
+        guard let context = UIGraphicsGetCurrentContext() else { return self }
+        
+        draw(in: CGRect(origin: .zero, size: size))
+        gradientLayer.render(in: context)
+        
+        let gradientImage = UIGraphicsGetImageFromCurrentImageContext()
+        UIGraphicsEndImageContext()
+        
+        return gradientImage ?? self
+    }
+    
     func resize(to newSize: CGSize) -> UIImage? {
         // Create a graphics context with the new size
         UIGraphicsBeginImageContextWithOptions(newSize, false, 0.0)
