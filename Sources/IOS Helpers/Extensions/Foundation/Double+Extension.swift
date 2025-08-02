@@ -12,6 +12,10 @@ public extension Double {
         return String(self)
     }
     
+    func toDoubleString() -> String {
+        return String(format: "%.2f", self)
+    }
+    
     func toHHMM() -> String {
         // Extract the whole hours part (e.g., 7 in 7.98)
         let hoursPart = Int(self)

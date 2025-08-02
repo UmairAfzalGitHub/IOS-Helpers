@@ -107,7 +107,7 @@ public extension UIViewController {
     }
 }
 
-extension UIViewController: UIGestureRecognizerDelegate {
+extension UIViewController: @retroactive UIGestureRecognizerDelegate {
     
     public func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
         return touch.view == gestureRecognizer.view
