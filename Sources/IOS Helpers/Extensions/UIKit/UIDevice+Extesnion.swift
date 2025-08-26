@@ -82,9 +82,14 @@ public extension UIDevice {
         return identifier
     }
     
-    // Method to check if the device is a smaller device like iPhone SE or iPhone 6S
-    func isSmallerDevice() -> Bool {
-        let screenHeight = UIScreen.main.bounds.height // iPhone SE (1st gen) has a screen height of 568 points (4-inch display) // iPhone 6/6S/7/8 have a screen height of 667 points (4.7-inch display)
+    var isSmallDevice: Bool {
+        // Screen height ≤ 667 includes: iPhone SE (1st/2nd/3rd gen), iPhone 6/7/8
+        let screenHeight = max(UIScreen.main.bounds.width, UIScreen.main.bounds.height)
         return screenHeight <= 667
+    }
+    
+    var hasNotch: Bool {
+        let bottom = UIApplication.shared.windows.filter {$0.isKeyWindow}.first?.safeAreaInsets.bottom ?? 0
+        return bottom > 0
     }
 }
