@@ -59,10 +59,7 @@ public extension UIApplication {
           to viewController: UIViewController,
           animated: Bool = true
       ) {
-          guard let window = connectedScenes
-                  .filter({ $0.activationState == .foregroundActive })
-                  .compactMap({ $0 as? UIWindowScene })
-                  .first?.windows.first(where: { $0.isKeyWindow }) else {
+          guard let window = UIApplication.shared.sceneWindow else {
               print("No key window found.")
               return
           }
