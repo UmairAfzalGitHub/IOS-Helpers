@@ -179,6 +179,13 @@ public class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate {
             let sdkInitElapsed = CACurrentMediaTime() - self.splashSdkInitStartTime
             AppLogger.log(String(format: "[SplashAdTiming] SDK_INIT_DONE — completion after %.2fs", sdkInitElapsed))
             AppLogger.log("📱 AdMob SDK initialization completed with status: \(status)")
+            // One-line mediation adapter health check: each adapter's ready/not-ready
+            // state (Vungle/Unity/… only report READY once their SDK has initialized).
+            let adapterSummary = status.adapterStatusesByClassName
+                .map { "\($0.key.components(separatedBy: ".").last ?? $0.key)=\($0.value.state == .ready ? "READY" : "NOT_READY")" }
+                .sorted()
+                .joined(separator: ", ")
+            AppLogger.log("📱 Mediation adapters: [\(adapterSummary)]")
             // Mark the SDK ready and drain anything that was waiting on it (splash
             // hand-off, onboarding banner, …). Do this before kicking off loads so
             // those waiters see a ready SDK.
