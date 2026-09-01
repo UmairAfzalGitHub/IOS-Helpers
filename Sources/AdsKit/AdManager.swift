@@ -222,7 +222,15 @@ public final class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate
 
         let oid = ObjectIdentifier(ad)
         dismissCompletions[oid] = { [weak self] in
-            self?.preloadInterstitial(slot) // refill for next time
+            // Auto-refill only RECURRING interstitials (frequency-gated ones), so the
+            // next eligible tap has an ad ready. One-shots (respectFrequency:false —
+            // splash / first-launch) are shown once per session and must NOT reload:
+            // a reload here would be an unshown load that drags down the unit's show
+            // rate. This mirrors v1, which only refilled the generic interstitial and
+            // left splash/paywall one-shots alone.
+            if respectFrequency {
+                self?.preloadInterstitial(slot)
+            }
             completion?()
         }
         ad.fullScreenContentDelegate = self
