@@ -1,13 +1,25 @@
 //
 //  AdManager.swift
-//  AdsKit
+//  AdsKit (v2)
 //
-//  Shared AdMob manager (banners / interstitials / native / rewarded / app-open).
-//  App-specific identity is injected, not hard-coded:
-//    • ad-unit ids come from an `AdConfiguration` passed to `configure(_:isSubscribed:)`
-//    • the "is the user subscribed?" check is an injected closure (each app keeps
-//      its own IAPManager / entitlement logic)
+//  Generic AdMob manager. The app defines its placements as `AdSlot`s (any number
+//  of each format); this manager loads, caches, and presents them keyed by
+//  `slot.key`. No fixed slot names, no central AdConfiguration.
+//
+//  App-specific identity is still injected:
+//    • ad-unit ids ride on each `AdSlot`
+//    • the "is the user subscribed?" check is an injected closure
 //    • analytics go through `AppAnalytics` (AnalyticsKit → Firebase)
+//
+//  Usage:
+//    AdManager.shared.configure(isSubscribed: { IAPManager.shared.isUserSubscribed })
+//    AdManager.shared.setupAds()
+//    AdManager.shared.preloadInterstitial(Ads.exitInterstitial)
+//    AdManager.shared.showInterstitial(Ads.exitInterstitial, from: self)
+//    AdManager.shared.loadBanner(Ads.homeBanner, in: self, into: bannerView)
+//    AdManager.shared.preloadNative(Ads.resultNative, count: 3)
+//    let ad = AdManager.shared.getNative(Ads.resultNative)
+//    AdManager.shared.showRewarded(Ads.unlockRewarded, from: self) { earned in … }
 //
 
 import Foundation
@@ -19,203 +31,83 @@ import AnalyticsKit
 import AppTrackingTransparency
 import CryptoKit
 
-// MARK: - Ad Manager
-public class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate {
+public final class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate {
     public static let shared = AdManager()
+    private override init() { super.init() }
 
-    // MARK: - Injected configuration
+    // MARK: - Injected dependencies
 
-    /// Per-app ad-unit ids. Set once via `configure(_:isSubscribed:)` before any
-    /// ad is loaded. Implicitly unwrapped because every load/show reads it and a
-    /// missing configuration is a programmer error (the app must configure at launch).
-    public private(set) var config: AdConfiguration!
-
-    /// Returns whether the current user is subscribed (ads suppressed). Injected so
-    /// AdsKit stays free of any particular IAP implementation. Defaults to `false`.
     private var isSubscribedProvider: () -> Bool = { false }
 
-    /// Convenience read of the injected subscription state.
+    /// Current subscription state (ads suppressed when true).
     public var isUserSubscribedNow: Bool { isSubscribedProvider() }
 
-    /// Wire per-app ad identity and the subscription check into the shared manager.
-    /// Call once at launch, before loading any ad.
-    public func configure(_ configuration: AdConfiguration,
-                          isSubscribed: @escaping () -> Bool = { false }) {
-        self.config = configuration
+    /// Wire the subscription check into the manager. Call once at launch.
+    public func configure(isSubscribed: @escaping () -> Bool = { false }) {
         self.isSubscribedProvider = isSubscribed
     }
 
-    // Ad Properties
-    public var appOpenAd: AppOpenAd?
-    public var interstitialAd: InterstitialAd?
-    public var splashInterstitialAd: InterstitialAd?
-    public var paywallInterstitialAd: InterstitialAd?
-    public var rewardedAd: RewardedAd?
-    private var nativeAdLoader: AdLoader?
-    private var nativeAdCompletions: [AdLoader: (NativeAd?) -> Void] = [:]
+    // MARK: - Global state
 
-    // State Management
-    private var isLoadingAppOpenAd = false
-    private var isLoadingInterstitial = false
-    private var isLoadingSplashInterstitial = false
-    private var isLoadingPaywallInterstitial = false
-    public private(set) var didSplashInterstitialFailToLoad = false
-    private var isLoadingRewarded = false
+    /// True while any full-screen ad (interstitial / rewarded / app-open) is on
+    /// screen — used to prevent overlapping presentations.
+    public private(set) var isShowingAd = false
 
-    /// Guards `setupAds()` against a second initialization (e.g. a re-entrant
-    /// scene connect). The AdMob SDK only needs to start once per process.
-    private var hasInitializedAds = false
-    /// Monotonic timestamp captured when `MobileAds.shared.start` is invoked,
-    /// used only to log SDK-init duration for diagnostics.
-    private var splashSdkInitStartTime: CFTimeInterval = 0
-
-    /// Whether `MobileAds.shared.start` has finished. Until this is `true` the SDK
-    /// is still initializing and any `load(...)` request is dropped, so screens that
-    /// want a fill (the onboarding banner, etc.) should gate on this. Splash blocks
-    /// its hand-off on this so the whole app runs with a ready SDK.
-    public private(set) var isSdkReady = false
-    /// Callbacks queued while the SDK is still initializing, drained (once) the
-    /// moment it becomes ready. Registered via `whenSdkReady(_:)`.
-    private var sdkReadyCallbacks: [() -> Void] = []
-
-    /// Runs `block` as soon as the AdMob SDK is initialized — immediately if it is
-    /// already ready, otherwise when `MobileAds.shared.start` completes. Always
-    /// invoked on the main queue.
-    public func whenSdkReady(_ block: @escaping () -> Void) {
-        if isSdkReady {
-            DispatchQueue.main.async { block() }
-        } else {
-            sdkReadyCallbacks.append(block)
-        }
-    }
-
-    /// Fired once when the splash interstitial finishes loading.
-    public var onSplashInterstitialLoaded: (() -> Void)?
-    /// Fired once when the splash interstitial load finishes with a failure
-    /// (no-fill / error) so Splash can navigate immediately instead of waiting.
-    public var onSplashInterstitialFailed: (() -> Void)?
-    private var adDidDismissFullScreenContentCallback: (() -> Void)?
-    private var adDidDismissRewardedCallback: ((Bool) -> Void)?
-    private var didGetNativeAd: ((NativeAd?) -> Void)?
-
-    private var splashBannerView: BannerView?
-    private var isSplashBannerLoaded = false
-
-    private var nativeAdPool: [NativeAd] = []
-    private let maxNativeAds = 3
-    private var shouldPrefetchNativeAds = true
-    /// Number of pool native loads currently scheduled or in flight. Counted so
-    /// overlapping `preloadNativeAds()` calls (splash + every `getNativeAd`) don't
-    /// each schedule a fresh batch and overfill the pool past `maxNativeAds`.
-    private var inFlightNativeLoads = 0
-
-    // Dedicated one-shot native for the full-screen onboarding ad page. Kept in
-    // its own slot (separate from the pool) so it is preloaded once and cached.
-    private var onboardingFullScreenNativeAd: NativeAd?
-    private var isLoadingOnboardingFullScreenNative = false
-
-    /// True while the onboarding full-screen native load is in flight (not yet
-    /// finished with success or failure). Lets Onboarding reserve the ad page for
-    /// an ad that is about to arrive, instead of dropping a load that finishes a
-    /// beat after `viewDidLoad`.
-    public var isOnboardingFullScreenNativeInFlight: Bool { isLoadingOnboardingFullScreenNative }
-
-    /// One-shot callback fired when the onboarding full-screen native load finishes
-    /// — with the ad on success, or `nil` on failure. Onboarding registers this
-    /// when it reserved the ad page while the load was still in flight, so it can
-    /// populate the page the moment the ad lands (recovering the load→show race).
-    public var onOnboardingFullScreenNativeReady: ((NativeAd?) -> Void)?
-
-    // Dedicated one-shot native for the Language screen's first ad (shown on
-    // screen load). Preloaded before the screen appears so it is visible
-    // immediately, in its own slot separate from the pool.
-    private var languageNativeAd: NativeAd?
-    private var isLoadingLanguageNative = false
-
-    public var isRewardGranted = false
-    public var avilableNativeAd: NativeAd?
-    public var isShowingAd = false
-    public var splashInterstitial = true
-    public var onboardingReviewEnabled = false
-    public var showRewardedAdScreen: Bool = true
-
-    /// Minimum time that must elapse between two generic interstitials. Replaces
-    /// the old tap-counter gate — an interstitial can show at most once every
-    /// `interstitialMinInterval` seconds. Splash & paywall interstitials are
-    /// exempt: they are one-shot per session and go through their own show
-    /// methods, which never consult this gate.
+    /// Minimum time between two frequency-gated interstitials. A `showInterstitial`
+    /// call with `respectFrequency: true` (default) won't present until this elapses
+    /// since the last gated interstitial dismissed. Pass `respectFrequency: false`
+    /// for one-shots (splash / first-launch) that must always show.
     public var interstitialMinInterval: TimeInterval = 30
-    /// When the last generic interstitial was dismissed. `nil` until the first
-    /// one is shown, so the first eligible request always passes the gate.
     private var lastInterstitialShownAt: Date?
 
-    private override init() {
-        super.init()
+    // MARK: - SDK init
+
+    private var hasInitializedAds = false
+    private var splashSdkInitStartTime: CFTimeInterval = 0
+    public private(set) var isSdkReady = false
+    private var sdkReadyCallbacks: [() -> Void] = []
+
+    /// Run `block` once the AdMob SDK is initialized (immediately if already ready).
+    public func whenSdkReady(_ block: @escaping () -> Void) {
+        if isSdkReady { DispatchQueue.main.async { block() } }
+        else { sdkReadyCallbacks.append(block) }
     }
 
-    // MARK: - Setup
+    /// Start the AdMob SDK. Idempotent.
     public func setupAds() {
         guard !hasInitializedAds else { return }
         hasInitializedAds = true
         AppLogger.log("📱 Setting up AdMob...")
 
         #if DEBUG
-        // Register this device as an AdMob test device so DEBUG builds always get
-        // test fills. The hash AdMob expects is the MD5 of the uppercased IDFV.
         let idfv = UIDevice.current.identifierForVendor?.uuidString ?? "nil"
         let idfvHash = Self.md5Hex(idfv.uppercased())
         AppLogger.log("📱 IDFV: \(idfv)")
         AppLogger.log("📱 IDFV MD5 (AdMob test device hash): \(idfvHash)")
-        MobileAds.shared.requestConfiguration.testDeviceIdentifiers = [
-            "GADSimulatorID",
-            idfvHash
-        ]
+        MobileAds.shared.requestConfiguration.testDeviceIdentifiers = ["GADSimulatorID", idfvHash]
         #endif
 
         splashSdkInitStartTime = CACurrentMediaTime()
         AppLogger.log("[SplashAdTiming] SDK_INIT_START — calling MobileAds.shared.start")
         MobileAds.shared.start { [weak self] status in
             guard let self = self else { return }
-            let sdkInitElapsed = CACurrentMediaTime() - self.splashSdkInitStartTime
-            AppLogger.log(String(format: "[SplashAdTiming] SDK_INIT_DONE — completion after %.2fs", sdkInitElapsed))
+            let elapsed = CACurrentMediaTime() - self.splashSdkInitStartTime
+            AppLogger.log(String(format: "[SplashAdTiming] SDK_INIT_DONE — completion after %.2fs", elapsed))
             AppLogger.log("📱 AdMob SDK initialization completed with status: \(status)")
-            // One-line mediation adapter health check: each adapter's ready/not-ready
-            // state (Vungle/Unity/… only report READY once their SDK has initialized).
             let adapterSummary = status.adapterStatusesByClassName
                 .map { "\($0.key.components(separatedBy: ".").last ?? $0.key)=\($0.value.state == .ready ? "READY" : "NOT_READY")" }
                 .sorted()
                 .joined(separator: ", ")
             AppLogger.log("📱 Mediation adapters: [\(adapterSummary)]")
-            // Mark the SDK ready and drain anything that was waiting on it (splash
-            // hand-off, onboarding banner, …). Do this before kicking off loads so
-            // those waiters see a ready SDK.
+
             self.isSdkReady = true
-            let readyCallbacks = self.sdkReadyCallbacks
+            let callbacks = self.sdkReadyCallbacks
             self.sdkReadyCallbacks.removeAll()
-            for callback in readyCallbacks { callback() }
-            // App Open ad is no longer loaded here. It is loaded when the app
-            // enters the background (see SceneDelegate.sceneDidEnterBackground), so
-            // it is fresh and ready to show on the next foreground — and we don't
-            // load one at launch that the splash interstitial preempts (which was
-            // dragging the App Open show rate down).
-            self.loadSplashInterstitialAd()
-            // The generic interstitial is NOT preloaded at launch. It is never shown
-            // during splash/onboarding/language — only on Home and later feature
-            // screens — so preloading it here meant every session paid a load that
-            // sat idle (and often expired unshown) through the whole pre-Home flow,
-            // dragging the interstitial show rate down. It is now loaded in
-            // HomeViewController.viewDidLoad (the first screen that can show it), and
-            // still self-heals on demand via showInterstitial.
-            // Note: the splash banner is loaded by SplashViewController itself,
-            // only after ATT/consent resolves (see SplashViewController.setupBanner),
-            // so it never loads behind the ATT prompt.
+            for cb in callbacks { cb() }
         }
     }
 
-    /// Builds an ad request, attaching the non-personalized-ads flag (npa=1)
-    /// whenever the user has NOT authorized tracking (ATT). Every ad load in the
-    /// app goes through this so the flag actually reaches the request —
-    /// registering `npa` on a throwaway request has no effect.
+    /// Builds an ad request, attaching npa=1 when ATT is not authorized.
     public static func makeAdRequest(placement: String = "unknown") -> Request {
         let request = Request()
         if ATTrackingManager.trackingAuthorizationStatus != .authorized {
@@ -231,611 +123,318 @@ public class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate {
 
     #if DEBUG
     private static func md5Hex(_ input: String) -> String {
-        let digest = Insecure.MD5.hash(data: Data(input.utf8))
-        return digest.map { String(format: "%02hhx", $0) }.joined()
+        Insecure.MD5.hash(data: Data(input.utf8)).map { String(format: "%02hhx", $0) }.joined()
     }
     #endif
 
-    /// StoreKit 2 entitlement check — true if any auto-renewable subscription is
-    /// currently active. Separate from the injected `isSubscribedProvider`; apps
-    /// can use this to feed their own entitlement store.
+    // MARK: - StoreKit helpers (optional convenience)
+
+    /// StoreKit 2 entitlement check — true if any auto-renewable subscription is active.
     public func isUserSubscribed() async -> Bool {
         for await result in Transaction.currentEntitlements {
-            switch result {
-            case .verified(let transaction):
-                if transaction.productType == .autoRenewable {
-                    return true
-                }
-            case .unverified:
-                continue
-            }
+            if case .verified(let t) = result, t.productType == .autoRenewable { return true }
         }
         return false
     }
 
-    public func checkSubscriptionAndSave() async {
-        let subscribed = await isUserSubscribed()
-        UserDefaults.standard.set(subscribed, forKey: "isUserSubscribed")
-    }
+    // MARK: - Keyed caches
 
-    // MARK: - App Open Ads
+    private var interstitials: [String: InterstitialAd] = [:]
+    private var loadingInterstitials: Set<String> = []
 
-    public func loadAppOpenAd() {
-        guard !isSubscribedProvider() else { return }
-        guard appOpenAd == nil else { return } // don't reload while one is already waiting
-        guard !isLoadingAppOpenAd else { return }
-        isLoadingAppOpenAd = true
+    private var rewardeds: [String: RewardedAd] = [:]
+    private var loadingRewardeds: Set<String> = []
 
-        AppOpenAd.load(with: config.appOpen.adId,
-                       request: Self.makeAdRequest(placement: "app_open")) { [weak self] ad, error in
-            guard let self = self else { return }
-            self.isLoadingAppOpenAd = false
+    private var appOpens: [String: AppOpenAd] = [:]
+    private var loadingAppOpens: Set<String> = []
 
-            if let error = error {
-                AppLogger.log("❌ Failed to load app open ad: \(error.localizedDescription)")
-                return
-            }
-            AppLogger.log("✅ App Open ad loaded successfully")
-            self.appOpenAd = ad
+    private var nativePools: [String: [NativeAd]] = [:]
+    private var nativeInFlight: [String: Int] = [:]
+    private var nativeLoaders: [AdLoader: (key: String, completion: ((NativeAd?) -> Void)?)] = [:]
+
+    // Full-screen presentation routing, keyed by the presented ad object.
+    private var dismissCompletions: [ObjectIdentifier: () -> Void] = [:]
+    private var rewardCompletions: [ObjectIdentifier: (Bool) -> Void] = [:]
+    private var rewardEarned: Set<ObjectIdentifier> = []
+
+    // MARK: - Format guard
+
+    @discardableResult
+    private func expect(_ slot: AdSlot, _ format: AdFormat, _ fn: String = #function) -> Bool {
+        guard slot.format == format else {
+            AppLogger.log("❌ AdSlot '\(slot.key)' is .\(slot.format) but \(fn) expects .\(format)")
+            return false
         }
-    }
-
-    public func showAppOpenAd() {
-        guard !isSubscribedProvider() else { return }
-        guard let appOpenAd = self.appOpenAd, !self.isShowingAd else { return }
-        guard shouldShowAd() else { return }
-
-        appOpenAd.fullScreenContentDelegate = self
-        appOpenAd.present(from: UIApplication.shared.topViewController!)
-        self.isShowingAd = true
-        self.appOpenAd = nil // consumed — the next background load refills it
-        AppLogger.log("▶️ App Open Ad shown successfully")
-    }
-
-    public func shouldShowAd() -> Bool {
-        let defaults = UserDefaults.standard
-        let currentTime = Date().timeIntervalSince1970 // Get current time in seconds
-
-        // Retrieve last ad time
-        let lastAdTime = defaults.double(forKey: "LastAdTime")
-
-        // If lastAdTime is 0, it means no ad was shown before, so show the ad
-        if lastAdTime > 0 {
-            let timeSinceLastAd = currentTime - lastAdTime
-
-            AppLogger.log("timeSinceLastAd: \(timeSinceLastAd)")
-            // Check if 5 seconds have passed since the last ad
-            if timeSinceLastAd < 5 {
-                AppLogger.log("Ad was shown \(timeSinceLastAd) seconds ago. Not showing ad.")
-                return false
-            }
-        }
-
-        // Save current time as last ad shown time
-        defaults.set(currentTime, forKey: "LastAdTime")
-
-        AppLogger.log("Showing ad now.")
         return true
     }
 
-    // MARK: - Interstitial Ads
-    public func loadInterstitialAd(id: AdMobId, completion: ((Bool?, InterstitialAd?) -> Void)? = nil) {
-        guard !isSubscribedProvider() else { return }
-        // An interstitial is already loaded and waiting — don't fetch a second one
-        // (that would discard the ready ad as an unshown load and tank show rate).
-        // Hand the waiting ad straight to the caller so its show flow proceeds.
-        if let interstitialAd = interstitialAd {
-            completion?(true, interstitialAd)
-            return
-        }
-        guard !isLoadingInterstitial else { return }
-        isLoadingInterstitial = true
-        AppLogger.log("📱 Loading Interstitial Ad...")
+    // MARK: - Interstitial
 
-        InterstitialAd.load(with: id.adId,
-                            request: Self.makeAdRequest(placement: id.analyticsId.rawValue)) { [weak self] ad, error in
+    public func isInterstitialReady(_ slot: AdSlot) -> Bool { interstitials[slot.key] != nil }
+
+    public func preloadInterstitial(_ slot: AdSlot, completion: ((Bool) -> Void)? = nil) {
+        guard expect(slot, .interstitial), !isSubscribedProvider() else { completion?(false); return }
+        if interstitials[slot.key] != nil { completion?(true); return }
+        guard !loadingInterstitials.contains(slot.key) else { completion?(false); return }
+        loadingInterstitials.insert(slot.key)
+        AppLogger.log("📱 Loading interstitial[\(slot.key)]…")
+        InterstitialAd.load(with: slot.adUnitID, request: Self.makeAdRequest(placement: slot.key)) { [weak self] ad, error in
             guard let self = self else { return }
-            self.isLoadingInterstitial = false
-
+            self.loadingInterstitials.remove(slot.key)
             if let error = error {
-                AppLogger.log("❌ Failed to load interstitial ad: \(error.localizedDescription)")
-                completion?(false, nil)
-                return
+                AppLogger.log("❌ interstitial[\(slot.key)] load failed: \(error.localizedDescription)")
+                completion?(false); return
             }
-            AppLogger.log("✅ Interstitial ad loaded successfully")
-            self.interstitialAd = ad
-            self.interstitialAd?.fullScreenContentDelegate = self
-            completion?(true, ad)
-        }
-    }
-
-    public func showInterstitial(adId: AdMobId, from viewController: UIViewController? = nil, completion: (() -> Void)? = nil) {
-        guard !isSubscribedProvider() else { completion?(); return }
-
-        // Time gate: at most one generic interstitial every `interstitialMinInterval`
-        // seconds (measured from the previous one's dismissal). Splash & paywall
-        // interstitials are exempt and never reach this method.
-        if let lastShown = lastInterstitialShownAt,
-           Date().timeIntervalSince(lastShown) < interstitialMinInterval {
-            AppLogger.log("❌ Interstitial gap not elapsed (need \(interstitialMinInterval)s)")
-            // Do NOT reload here — an ad is already loaded and waiting for the next
-            // eligible tap. Reloading would discard it as an unshown load.
-            completion?()
-            return
-        }
-
-        guard !isShowingAd else {
-            AppLogger.log("❌ Interstitial Ad cannot be shown because an ad is already being displayed")
-            // Same as above: keep the waiting ad, don't reload.
-            completion?()
-            return
-        }
-
-        guard let interstitialAd = interstitialAd else {
-            AppLogger.log("❌ Interstitial Ad is not available")
-            loadInterstitialAd(id: adId) // preload so the next eligible tap can show one
-            completion?()
-            return
-        }
-
-        // analytics
-        AppAnalytics.logEvent("ad_" + adId.analyticsId.rawValue)
-
-        interstitialAd.fullScreenContentDelegate = self
-        interstitialAd.present(from: viewController)
-        isShowingAd = true
-        AppLogger.log("▶️ Interstitial Ad shown successfully")
-
-        // Call the completion block after the ad is dismissed
-        adDidDismissFullScreenContentCallback = completion
-    }
-
-    // MARK: - Splash Interstitial (one-shot, splash only)
-    /// Preloaded once during `setupAds()` so it is ready by the time the splash
-    /// finishes. Kept in its own slot — decoupled from the generic interstitial
-    /// and its `adCounter` frequency gate.
-    public func loadSplashInterstitialAd() {
-        guard !isSubscribedProvider() else { return }
-        guard splashInterstitial else { return } // remote enable flag
-        guard !isLoadingSplashInterstitial else { return }
-        isLoadingSplashInterstitial = true
-        didSplashInterstitialFailToLoad = false
-        AppLogger.log("📱 Loading Splash Interstitial Ad...")
-
-        InterstitialAd.load(with: config.splashInterstitial.adId,
-                            request: Self.makeAdRequest(placement: "splash_interstitial")) { [weak self] ad, error in
-            guard let self = self else { return }
-            self.isLoadingSplashInterstitial = false
-
-            if let error = error {
-                AppLogger.log("❌ Splash interstitial load failed: \(error.localizedDescription)")
-                self.didSplashInterstitialFailToLoad = true
-                let failHandler = self.onSplashInterstitialFailed
-                self.onSplashInterstitialLoaded = nil
-                self.onSplashInterstitialFailed = nil
-                failHandler?()
-                return
-            }
-            AppLogger.log("✅ Splash interstitial loaded")
-            self.splashInterstitialAd = ad
-            self.splashInterstitialAd?.fullScreenContentDelegate = self
-            let loadHandler = self.onSplashInterstitialLoaded
-            self.onSplashInterstitialLoaded = nil
-            self.onSplashInterstitialFailed = nil
-            loadHandler?()
-        }
-    }
-
-    public func showSplashInterstitial(from viewController: UIViewController? = nil, completion: (() -> Void)? = nil) {
-        guard !isSubscribedProvider() else {
-            AppLogger.log("⛔️ showSplashInterstitial skipped: user subscribed")
-            completion?(); return
-        }
-        guard let ad = splashInterstitialAd, !isShowingAd else {
-            AppLogger.log("⛔️ showSplashInterstitial skipped: ad=\(splashInterstitialAd == nil ? "nil" : "ready"), isShowingAd=\(isShowingAd)")
-            completion?(); return
-        }
-        guard let presenting = viewController ?? UIApplication.shared.topViewController else {
-            AppLogger.log("⛔️ showSplashInterstitial skipped: no presenting VC")
-            completion?(); return
-        }
-
-        // analytics
-        AppAnalytics.logEvent("ad_" + config.splashInterstitial.analyticsId.rawValue)
-
-        ad.fullScreenContentDelegate = self
-        ad.present(from: presenting)
-        isShowingAd = true
-        adDidDismissFullScreenContentCallback = completion
-        AppLogger.log("▶️ Splash interstitial shown")
-    }
-
-    // MARK: - Paywall Interstitial (one-shot, shown when the home paywall is closed)
-    /// Preloaded while the home paywall is on screen so it is ready by the time the
-    /// user taps the paywall's close button. Kept in its own slot — decoupled from
-    /// the generic interstitial and its `adCounter` frequency gate.
-    public func loadPaywallInterstitialAd() {
-        guard !isSubscribedProvider() else { return }
-        guard !isLoadingPaywallInterstitial else { return }
-        isLoadingPaywallInterstitial = true
-        AppLogger.log("📱 Loading Paywall Interstitial Ad...")
-
-        InterstitialAd.load(with: config.paywallInterstitial.adId,
-                            request: Self.makeAdRequest(placement: "paywall_interstitial")) { [weak self] ad, error in
-            guard let self = self else { return }
-            self.isLoadingPaywallInterstitial = false
-
-            if let error = error {
-                AppLogger.log("❌ Paywall interstitial load failed: \(error.localizedDescription)")
-                return
-            }
-            AppLogger.log("✅ Paywall interstitial loaded")
-            self.paywallInterstitialAd = ad
-            self.paywallInterstitialAd?.fullScreenContentDelegate = self
-        }
-    }
-
-    /// Shows the preloaded paywall interstitial. The completion always fires —
-    /// after the ad is dismissed, or immediately if no ad is available — so the
-    /// caller can continue its flow (e.g. request notification permission).
-    public func showPaywallInterstitial(from viewController: UIViewController? = nil, completion: (() -> Void)? = nil) {
-        guard !isSubscribedProvider() else { completion?(); return }
-        guard let ad = paywallInterstitialAd, !isShowingAd else { completion?(); return }
-        guard let presenting = viewController ?? UIApplication.shared.topViewController else {
-            completion?(); return
-        }
-
-        // analytics
-        AppAnalytics.logEvent("ad_" + config.paywallInterstitial.analyticsId.rawValue)
-
-        ad.fullScreenContentDelegate = self
-        ad.present(from: presenting)
-        isShowingAd = true
-        adDidDismissFullScreenContentCallback = completion
-        AppLogger.log("▶️ Paywall interstitial shown")
-    }
-
-    // MARK: - Rewarded Ads
-    public func loadRewardedAd(id: AdMobId, completion: ((Bool?) -> Void)? = nil) {
-        guard !isSubscribedProvider() else { return }
-        guard !isLoadingRewarded else { return }
-
-        isLoadingRewarded = true
-        AppLogger.log("📱 Loading Rewarded Ad...")
-
-        RewardedAd.load(with: id.adId,
-                        request: Self.makeAdRequest(placement: id.analyticsId.rawValue)) { [weak self] ad, error in
-            guard let self = self else { return }
-            self.isLoadingRewarded = false
-
-            if let error = error {
-                AppLogger.log("❌ Failed to load rewarded ad: \(error.localizedDescription)")
-                completion?(false)
-                return
-            }
-            AppLogger.log("✅ Rewarded ad loaded successfully")
-            self.rewardedAd = ad
+            ad?.fullScreenContentDelegate = self
+            self.interstitials[slot.key] = ad
+            AppLogger.log("✅ interstitial[\(slot.key)] loaded")
             completion?(true)
         }
     }
 
-    public func showRewardedAd(adId: AdMobId, from viewController: UIViewController, completion: @escaping (Bool) -> Void) {
-        guard let rewardedAd = rewardedAd else {
-            AppLogger.log("❌ Rewarded Ad is not available")
-            completion(false)
-            return
-        }
+    /// Present a preloaded interstitial. `respectFrequency` (default true) enforces
+    /// `interstitialMinInterval`; pass false for one-shots (splash/first-launch).
+    /// `completion` always fires — after dismissal, or immediately if it can't show.
+    public func showInterstitial(_ slot: AdSlot,
+                                 from viewController: UIViewController? = nil,
+                                 respectFrequency: Bool = true,
+                                 completion: (() -> Void)? = nil) {
+        guard expect(slot, .interstitial), !isSubscribedProvider() else { completion?(); return }
 
-        guard !isShowingAd else {
-            AppLogger.log("❌ Rewarded Ad cannot be shown because an ad is already being displayed")
-            completion(false)
-            return
+        if respectFrequency, let last = lastInterstitialShownAt,
+           Date().timeIntervalSince(last) < interstitialMinInterval {
+            AppLogger.log("❌ interstitial[\(slot.key)] gated (need \(interstitialMinInterval)s)")
+            completion?(); return
         }
-
-        // analytics
-        AppAnalytics.logEvent("ad_" + adId.analyticsId.rawValue)
-
-        self.adDidDismissRewardedCallback = completion
-        rewardedAd.fullScreenContentDelegate = self
-        rewardedAd.present(from: viewController) { [weak self] in
-            self?.isRewardGranted = true
+        guard !isShowingAd else { completion?(); return }
+        guard let ad = interstitials[slot.key] else {
+            AppLogger.log("❌ interstitial[\(slot.key)] not ready")
+            preloadInterstitial(slot)
+            completion?(); return
         }
+        guard let presenter = viewController ?? UIApplication.shared.topViewController else { completion?(); return }
+
+        interstitials[slot.key] = nil // consume
+        AppAnalytics.logEvent("ad_" + slot.format.rawValue)
+        if respectFrequency { lastInterstitialShownAt = Date() }
+
+        let oid = ObjectIdentifier(ad)
+        dismissCompletions[oid] = { [weak self] in
+            self?.preloadInterstitial(slot) // refill for next time
+            completion?()
+        }
+        ad.fullScreenContentDelegate = self
         isShowingAd = true
-        AppLogger.log("▶️ Rewarded Ad shown successfully")
+        ad.present(from: presenter)
+        AppLogger.log("▶️ interstitial[\(slot.key)] shown")
     }
 
-    // MARK: - Banner Ads
+    // MARK: - Rewarded
 
-    public func loadbannerAd(adId: AdMobId, bannerView: BannerView?, root: UIViewController) {
-        guard !isSubscribedProvider() else { return }
-        bannerView?.adUnitID = adId.adId
-        bannerView?.rootViewController = root
-        bannerView?.load(Self.makeAdRequest(placement: adId.analyticsId.rawValue))
-        // analytics
-        AppAnalytics.logEvent("ad_" + adId.analyticsId.rawValue)
+    public func isRewardedReady(_ slot: AdSlot) -> Bool { rewardeds[slot.key] != nil }
+
+    public func preloadRewarded(_ slot: AdSlot, completion: ((Bool) -> Void)? = nil) {
+        guard expect(slot, .rewarded), !isSubscribedProvider() else { completion?(false); return }
+        if rewardeds[slot.key] != nil { completion?(true); return }
+        guard !loadingRewardeds.contains(slot.key) else { completion?(false); return }
+        loadingRewardeds.insert(slot.key)
+        AppLogger.log("📱 Loading rewarded[\(slot.key)]…")
+        RewardedAd.load(with: slot.adUnitID, request: Self.makeAdRequest(placement: slot.key)) { [weak self] ad, error in
+            guard let self = self else { return }
+            self.loadingRewardeds.remove(slot.key)
+            if let error = error {
+                AppLogger.log("❌ rewarded[\(slot.key)] load failed: \(error.localizedDescription)")
+                completion?(false); return
+            }
+            self.rewardeds[slot.key] = ad
+            AppLogger.log("✅ rewarded[\(slot.key)] loaded")
+            completion?(true)
+        }
     }
 
-    public func preloadSplashBanner(adID: String) {
-        guard !isSubscribedProvider() else { return }
-        AppLogger.log("📱 Preloading Splash Banner...")
-        let screenWidth = UIScreen.main.bounds.width
-        let adSize = currentOrientationInlineAdaptiveBanner(width: screenWidth)
-        splashBannerView = BannerView(adSize: adSize)
-        splashBannerView?.adUnitID = adID
-        splashBannerView?.load(Self.makeAdRequest(placement: "splash_banner"))
+    /// Present a preloaded rewarded ad. `completion(earned)` fires after dismissal
+    /// (`true` if the reward was granted), or immediately with `false` if it can't show.
+    public func showRewarded(_ slot: AdSlot,
+                             from viewController: UIViewController,
+                             completion: @escaping (Bool) -> Void) {
+        guard expect(slot, .rewarded), !isSubscribedProvider() else { completion(false); return }
+        guard !isShowingAd, let ad = rewardeds[slot.key] else {
+            AppLogger.log("❌ rewarded[\(slot.key)] not ready / busy")
+            completion(false); return
+        }
+        rewardeds[slot.key] = nil // consume
+        AppAnalytics.logEvent("ad_" + slot.format.rawValue)
+
+        let oid = ObjectIdentifier(ad)
+        rewardCompletions[oid] = completion
+        ad.fullScreenContentDelegate = self
+        isShowingAd = true
+        ad.present(from: viewController) { [weak self] in
+            self?.rewardEarned.insert(oid)
+        }
+        AppLogger.log("▶️ rewarded[\(slot.key)] shown")
     }
 
-    public func getSplashBanner(for viewController: UIViewController) -> BannerView? {
-        guard !isSubscribedProvider() else { return nil }
-        splashBannerView?.rootViewController = viewController
-        let banner = splashBannerView
-        // We don't null it out here because we might need it if viewWillAppear is called multiple times,
-        // but typically for splash it's one-off.
+    // MARK: - App Open
+
+    public func isAppOpenReady(_ slot: AdSlot) -> Bool { appOpens[slot.key] != nil }
+
+    public func preloadAppOpen(_ slot: AdSlot, completion: ((Bool) -> Void)? = nil) {
+        guard expect(slot, .appOpen), !isSubscribedProvider() else { completion?(false); return }
+        if appOpens[slot.key] != nil { completion?(true); return }
+        guard !loadingAppOpens.contains(slot.key) else { completion?(false); return }
+        loadingAppOpens.insert(slot.key)
+        AppOpenAd.load(with: slot.adUnitID, request: Self.makeAdRequest(placement: slot.key)) { [weak self] ad, error in
+            guard let self = self else { return }
+            self.loadingAppOpens.remove(slot.key)
+            if let error = error {
+                AppLogger.log("❌ appOpen[\(slot.key)] load failed: \(error.localizedDescription)")
+                completion?(false); return
+            }
+            self.appOpens[slot.key] = ad
+            AppLogger.log("✅ appOpen[\(slot.key)] loaded")
+            completion?(true)
+        }
+    }
+
+    public func showAppOpen(_ slot: AdSlot,
+                            from viewController: UIViewController? = nil,
+                            completion: (() -> Void)? = nil) {
+        guard expect(slot, .appOpen), !isSubscribedProvider() else { completion?(); return }
+        guard !isShowingAd, let ad = appOpens[slot.key] else { completion?(); return }
+        guard let presenter = viewController ?? UIApplication.shared.topViewController else { completion?(); return }
+        appOpens[slot.key] = nil // consume
+        AppAnalytics.logEvent("ad_" + slot.format.rawValue)
+        let oid = ObjectIdentifier(ad)
+        dismissCompletions[oid] = { completion?() }
+        ad.fullScreenContentDelegate = self
+        isShowingAd = true
+        ad.present(from: presenter)
+        AppLogger.log("▶️ appOpen[\(slot.key)] shown")
+    }
+
+    // MARK: - Banner
+
+    /// Build a banner for a slot (adaptive inline). Caller owns layout.
+    public func makeBanner(_ slot: AdSlot, rootViewController: UIViewController) -> BannerView? {
+        guard expect(slot, .banner), !isSubscribedProvider() else { return nil }
+        let size = currentOrientationInlineAdaptiveBanner(width: UIScreen.main.bounds.width)
+        let banner = BannerView(adSize: size)
+        banner.adUnitID = slot.adUnitID
+        banner.rootViewController = rootViewController
+        banner.load(Self.makeAdRequest(placement: slot.key))
+        AppAnalytics.logEvent("ad_" + slot.format.rawValue)
         return banner
     }
 
-    // MARK: - Adaptive Inline Banner
-    public func createInlineBanner(in viewController: UIViewController, adID: String) -> BannerView {
-        let screenWidth = UIScreen.main.bounds.width
-        let adSize = currentOrientationInlineAdaptiveBanner(width: screenWidth)
-
-        let bannerView = BannerView(adSize: adSize)
-
-        bannerView.adUnitID = adID
-        bannerView.rootViewController = viewController
-        bannerView.load(Self.makeAdRequest(placement: "banner"))
-        return bannerView
-    }
-
+    /// Build a banner for a slot and pin it to fill `view`. Clears `view`'s subviews first.
     @discardableResult
-    public func loadBanner(in viewController: UIViewController, into view: UIView, adID: String) -> BannerView? {
-        // Clear previous ads if any
+    public func loadBanner(_ slot: AdSlot, in viewController: UIViewController, into view: UIView) -> BannerView? {
         view.subviews.forEach { $0.removeFromSuperview() }
-
-        guard !isSubscribedProvider() else { return nil }
-
-        let bannerView = createInlineBanner(in: viewController, adID: adID)
-        bannerView.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(bannerView)
-
+        guard let banner = makeBanner(slot, rootViewController: viewController) else { return nil }
+        banner.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(banner)
         NSLayoutConstraint.activate([
-            bannerView.topAnchor.constraint(equalTo: view.topAnchor),
-            bannerView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            bannerView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            bannerView.trailingAnchor.constraint(equalTo: view.trailingAnchor)
+            banner.topAnchor.constraint(equalTo: view.topAnchor),
+            banner.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            banner.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            banner.trailingAnchor.constraint(equalTo: view.trailingAnchor)
         ])
-
-        return bannerView
+        return banner
     }
 
-    // MARK: - Native Ads
+    // MARK: - Native
 
-    public func preloadNativeAds() {
-        guard let root = UIApplication.shared.sceneWindow?.rootViewController else { return }
+    /// Number of ready (cached) native ads for a slot.
+    public func nativeReadyCount(_ slot: AdSlot) -> Int { nativePools[slot.key]?.count ?? 0 }
 
-        // Only load the deficit that isn't already covered by the pool OR by loads
-        // already scheduled/in flight. Without subtracting `inFlightNativeLoads`,
-        // overlapping calls (splash + every getNativeAd) each schedule a full batch
-        // and the pool overfills past maxNativeAds (seen in logs growing to 6).
-        let deficit = maxNativeAds - nativeAdPool.count - inFlightNativeLoads
-        guard deficit > 0 else { return }
-
-        // Load sequentially with increasing delays to avoid overwhelming the ad network.
-        for index in 0..<deficit {
-            // Reserve the slot synchronously so a concurrent call sees it immediately.
-            inFlightNativeLoads += 1
-            let delay = 2.0 * Double(index + 1)
-
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self = self else { return }
-
-                self.loadNativeAd(adId: self.config.native, from: root, placement: "pool") { [weak self] ad in
-                    guard let self = self else { return }
-                    self.inFlightNativeLoads = max(0, self.inFlightNativeLoads - 1)
-
-                    // Cap the pool — a late-arriving ad from a batch scheduled
-                    // before some other batch filled the pool must not overflow it.
-                    if let ad = ad, self.nativeAdPool.count < self.maxNativeAds {
-                        self.nativeAdPool.append(ad)
-                    }
-                }
-            }
+    /// Preload up to `count` native ads for a slot into its pool. `completion` fires
+    /// once per loaded ad (ad on success, nil on failure).
+    public func preloadNative(_ slot: AdSlot,
+                              count: Int = 1,
+                              from viewController: UIViewController? = nil,
+                              completion: ((NativeAd?) -> Void)? = nil) {
+        guard expect(slot, .native), !isSubscribedProvider() else { completion?(nil); return }
+        guard let root = viewController ?? UIApplication.shared.sceneWindow?.rootViewController else {
+            completion?(nil); return
+        }
+        let have = nativePools[slot.key]?.count ?? 0
+        let inflight = nativeInFlight[slot.key] ?? 0
+        let need = max(0, count - have - inflight)
+        guard need > 0 else { completion?(nativePools[slot.key]?.first); return }
+        for _ in 0..<need {
+            nativeInFlight[slot.key, default: 0] += 1
+            let loader = AdLoader(adUnitID: slot.adUnitID, rootViewController: root, adTypes: [.native], options: nil)
+            loader.delegate = self
+            nativeLoaders[loader] = (slot.key, completion)
+            loader.load(Self.makeAdRequest(placement: slot.key))
         }
     }
 
-    public func getNativeAd(stopPrefetch: Bool = false) -> NativeAd? {
-        if stopPrefetch {
-            shouldPrefetchNativeAds = false
-        }
-        if !nativeAdPool.isEmpty {
-            let ad = nativeAdPool.removeFirst()
-            if shouldPrefetchNativeAds {
-                preloadNativeAds()
-            }
-            return ad
-        }
-        if shouldPrefetchNativeAds {
-            preloadNativeAds()
-        }
-        return nil
-    }
-
-    public func resumeNativeAdPrefetch() {
-        shouldPrefetchNativeAds = true
-        preloadNativeAds()
-    }
-
-    // MARK: - Onboarding Full-Screen Native (one-shot, preloaded)
-
-    /// Preloads the dedicated full-screen onboarding native so it is cached by
-    /// the time onboarding builds its pages. Idempotent — a second call while a
-    /// load is in flight or an ad is already cached is a no-op.
-    public func preloadOnboardingFullScreenNativeAd() {
-        guard !isSubscribedProvider() else { return }
-        guard onboardingFullScreenNativeAd == nil, !isLoadingOnboardingFullScreenNative else { return }
-        guard let root = UIApplication.shared.sceneWindow?.rootViewController else { return }
-        isLoadingOnboardingFullScreenNative = true
-        loadNativeAd(adId: config.onboardingFullScreenNative, from: root, placement: "onboarding_fullscreen") { [weak self] ad in
-            guard let self = self else { return }
-            self.isLoadingOnboardingFullScreenNative = false
-            if let ad = ad {
-                self.onboardingFullScreenNativeAd = ad
-            }
-            // Notify a waiting Onboarding screen (if it reserved the page while this
-            // load was in flight) so it can show a late-arriving ad instead of
-            // discarding it. Fires once, then clears.
-            let readyHandler = self.onOnboardingFullScreenNativeReady
-            self.onOnboardingFullScreenNativeReady = nil
-            readyHandler?(ad)
-        }
-    }
-
-    /// The cached full-screen onboarding native, if one preloaded in time.
-    public func cachedOnboardingFullScreenNativeAd() -> NativeAd? {
-        return onboardingFullScreenNativeAd
-    }
-
-    /// Returns the cached full-screen onboarding native and clears the slot.
-    @discardableResult
-    public func consumeOnboardingFullScreenNativeAd() -> NativeAd? {
-        let ad = onboardingFullScreenNativeAd
-        onboardingFullScreenNativeAd = nil
+    /// Pop one cached native ad for a slot (nil if none ready).
+    public func getNative(_ slot: AdSlot) -> NativeAd? {
+        guard var pool = nativePools[slot.key], !pool.isEmpty else { return nil }
+        let ad = pool.removeFirst()
+        nativePools[slot.key] = pool
         return ad
     }
 
-    // MARK: - Language Screen Native (one-shot, preloaded)
+    // MARK: - AdLoaderDelegate / NativeAdLoaderDelegate
 
-    /// Preloads the Language screen's first native so it is cached before the
-    /// screen appears and can be shown immediately on load. Idempotent — a
-    /// second call while a load is in flight or an ad is already cached is a
-    /// no-op.
-    public func preloadLanguageNativeAd() {
-        guard !isSubscribedProvider() else { return }
-        guard languageNativeAd == nil, !isLoadingLanguageNative else { return }
-        guard let root = UIApplication.shared.sceneWindow?.rootViewController else { return }
-        isLoadingLanguageNative = true
-        AppLogger.log("📱 Preloading language native...")
-        loadNativeAd(adId: config.languageNative1, from: root, placement: "language") { [weak self] ad in
-            guard let self = self else { return }
-            self.isLoadingLanguageNative = false
-            if let ad = ad {
-                AppLogger.log("✅ Language native loaded")
-                self.languageNativeAd = ad
-            } else {
-                AppLogger.log("❌ Language native failed to load")
-            }
-        }
+    public func adLoader(_ adLoader: AdLoader, didReceive nativeAd: NativeAd) {
+        guard let (key, completion) = nativeLoaders[adLoader] else { return }
+        nativeLoaders[adLoader] = nil
+        nativeInFlight[key] = max(0, (nativeInFlight[key] ?? 1) - 1)
+        nativePools[key, default: []].append(nativeAd)
+        AppLogger.log("✅ native[\(key)] loaded (pool=\(nativePools[key]?.count ?? 0))")
+        completion?(nativeAd)
     }
 
-    /// Returns the cached Language native and clears the slot.
-    @discardableResult
-    public func consumeLanguageNativeAd() -> NativeAd? {
-        let ad = languageNativeAd
-        languageNativeAd = nil
-        return ad
+    public func adLoader(_ adLoader: AdLoader, didFailToReceiveAdWithError error: Error) {
+        guard let (key, completion) = nativeLoaders[adLoader] else { return }
+        nativeLoaders[adLoader] = nil
+        nativeInFlight[key] = max(0, (nativeInFlight[key] ?? 1) - 1)
+        AppLogger.log("❌ native[\(key)] failed: \(error.localizedDescription)")
+        completion?(nil)
     }
 
-    /// - Parameter placement: human-readable slot name ("onboarding_fullscreen",
-    ///   "pool", "country", "language", …) used only for logging. In DEBUG every
-    ///   native shares the same Google test unit, so the unit id can't tell them
-    ///   apart — this label tags the ad request per slot.
-    public func loadNativeAd(adId: AdMobId, from viewController: UIViewController,
-                             placement: String = "native",
-                             completion: ((GoogleMobileAds.NativeAd?) -> Void)?) {
-        guard !isSubscribedProvider() else { return }
-
-        let googleAdLoader = GoogleMobileAds.AdLoader(adUnitID: adId.adId,
-                                                      rootViewController: viewController,
-                                                      adTypes: [.native],
-                                                      options: nil)
-        googleAdLoader.delegate = self
-        self.nativeAdCompletions[googleAdLoader] = completion
-        googleAdLoader.load(Self.makeAdRequest(placement: placement))
-        self.nativeAdLoader = googleAdLoader
-    }
+    public func adLoaderDidFinishLoading(_ adLoader: AdLoader) { /* no-op */ }
 }
 
-// MARK: - GADFullScreenContentDelegate
+// MARK: - FullScreenContentDelegate
 extension AdManager: FullScreenContentDelegate {
     public func adDidDismissFullScreenContent(_ ad: FullScreenPresentingAd) {
         isShowingAd = false
+        let oid = ObjectIdentifier(ad)
 
-        // Identify which slot actually dismissed. Only that slot should be reset
-        // and refilled — resetting a slot that didn't dismiss discards an
-        // already-loaded (already-counted) ad without ever showing it, which is
-        // what was tanking the interstitial show rate: App Open / splash / paywall
-        // dismissals were nil-ing and re-requesting the waiting generic interstitial
-        // on every foreground cycle, inflating loads with no matching shows.
-        let wasGenericInterstitial = (ad === interstitialAd)
-        let wasSplashInterstitial = (ad === splashInterstitialAd)
-        let wasPaywallInterstitial = (ad === paywallInterstitialAd)
-        let wasRewarded = (ad === rewardedAd)
-
-        // Only the generic interstitial participates in the 30s gate. Stamp the
-        // dismissal time so the next one can't show until the interval elapses.
-        // (Splash & paywall interstitials are exempt — they must not start the clock.)
-        if wasGenericInterstitial {
-            lastInterstitialShownAt = Date()
+        if let reward = rewardCompletions[oid] {
+            let earned = rewardEarned.contains(oid)
+            rewardCompletions[oid] = nil
+            rewardEarned.remove(oid)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { reward(earned) }
         }
-
-        // Clear only the slot that was actually consumed. The other slots keep any
-        // preloaded ad they already hold.
-        if wasSplashInterstitial { splashInterstitialAd = nil }
-        if wasPaywallInterstitial { paywallInterstitialAd = nil }
-        if wasRewarded { rewardedAd = nil }
-
-        // Refill the generic interstitial ONLY when a generic interstitial was the
-        // ad that just dismissed (i.e. we actually consumed it). App Open, splash,
-        // paywall and rewarded dismissals leave the waiting generic interstitial
-        // untouched so it can still be shown on the next eligible tap.
-        if wasGenericInterstitial {
-            interstitialAd = nil
-            // Preload the next generic interstitial so it's ready for the following
-            // eligible tap once the interval has elapsed.
-            loadInterstitialAd(id: config.interstitial)
+        if let dismiss = dismissCompletions[oid] {
+            dismissCompletions[oid] = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { dismiss() }
         }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: {
-            self.adDidDismissFullScreenContentCallback?()
-            self.adDidDismissRewardedCallback?(self.isRewardGranted)
-
-            self.adDidDismissFullScreenContentCallback = nil
-            self.adDidDismissRewardedCallback = nil
-        })
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: {
-            self.isRewardGranted = false
-        })
     }
 
     public func ad(_ ad: FullScreenPresentingAd, didFailToPresentFullScreenContentWithError error: Error) {
         isShowingAd = false
         AppLogger.log("❌ Failed to present ad: \(error.localizedDescription)")
-    }
-
-    // MARK: - NativeAdLoaderDelegate
-
-    public func adLoader(_ adLoader: GoogleMobileAds.AdLoader, didReceive nativeAd: GoogleMobileAds.NativeAd) {
-        avilableNativeAd = nativeAd
-        // Use the completion from our dictionary instead of the global property
-        if let completion = nativeAdCompletions[adLoader] {
-            completion(nativeAd)
+        let oid = ObjectIdentifier(ad)
+        if let reward = rewardCompletions[oid] {
+            rewardCompletions[oid] = nil
+            rewardEarned.remove(oid)
+            reward(false)
         }
-        nativeAdCompletions[adLoader] = nil
-    }
-
-    public func adLoader(_ adLoader: GoogleMobileAds.AdLoader, didFailToReceiveAdWithError error: Error) {
-        if let completion = nativeAdCompletions[adLoader] {
-            completion(nil)
+        if let dismiss = dismissCompletions[oid] {
+            dismissCompletions[oid] = nil
+            dismiss()
         }
-        nativeAdCompletions[adLoader] = nil
     }
 
-    public func adLoaderDidFinishLoading(_ adLoader: GoogleMobileAds.AdLoader) {
-        // no-op (kept for protocol conformance).
-    }
-
-    public func adDidRecordImpression(_ ad: any GoogleMobileAds.FullScreenPresentingAd) {
+    public func adDidRecordImpression(_ ad: FullScreenPresentingAd) {
         AppAnalytics.logEvent("custom_ad_impression")
     }
 }
