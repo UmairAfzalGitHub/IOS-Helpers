@@ -151,6 +151,8 @@ public final class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate
     private var nativePools: [String: [NativeAd]] = [:]
     private var nativeInFlight: [String: Int] = [:]
     private var nativeLoaders: [AdLoader: (key: String, completion: ((NativeAd?) -> Void)?)] = [:]
+    // One-shot native loads (handed straight back, not added to any pool).
+    private var directNativeLoaders: [AdLoader: (NativeAd?) -> Void] = [:]
 
     // Full-screen presentation routing, keyed by the presented ad object.
     private var dismissCompletions: [ObjectIdentifier: () -> Void] = [:]
@@ -327,6 +329,16 @@ public final class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate
         return banner
     }
 
+    /// Load a banner for `slot` into an EXISTING banner view the caller already owns
+    /// (e.g. one laid out in a xib). Sets its unit id / root and kicks off the load.
+    public func loadBanner(_ slot: AdSlot, into bannerView: BannerView, rootViewController: UIViewController) {
+        guard expect(slot, .banner), !isSubscribedProvider() else { return }
+        bannerView.adUnitID = slot.adUnitID
+        bannerView.rootViewController = rootViewController
+        bannerView.load(Self.makeAdRequest(placement: slot.key))
+        AppAnalytics.logEvent("ad_" + slot.format.rawValue)
+    }
+
     /// Build a banner for a slot and pin it to fill `view`. Clears `view`'s subviews first.
     @discardableResult
     public func loadBanner(_ slot: AdSlot, in viewController: UIViewController, into view: UIView) -> BannerView? {
@@ -371,6 +383,19 @@ public final class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate
         }
     }
 
+    /// Load a single native ad for a slot and hand it straight back via `completion`
+    /// (NOT added to the pool). Use for placements rendered immediately on load;
+    /// use `preloadNative`/`getNative` for a cached pool instead.
+    public func loadNative(_ slot: AdSlot,
+                           from viewController: UIViewController,
+                           completion: @escaping (NativeAd?) -> Void) {
+        guard expect(slot, .native), !isSubscribedProvider() else { completion(nil); return }
+        let loader = AdLoader(adUnitID: slot.adUnitID, rootViewController: viewController, adTypes: [.native], options: nil)
+        loader.delegate = self
+        directNativeLoaders[loader] = completion
+        loader.load(Self.makeAdRequest(placement: slot.key))
+    }
+
     /// Pop one cached native ad for a slot (nil if none ready).
     public func getNative(_ slot: AdSlot) -> NativeAd? {
         guard var pool = nativePools[slot.key], !pool.isEmpty else { return nil }
@@ -382,6 +407,13 @@ public final class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate
     // MARK: - AdLoaderDelegate / NativeAdLoaderDelegate
 
     public func adLoader(_ adLoader: AdLoader, didReceive nativeAd: NativeAd) {
+        // One-shot direct load — hand back, don't pool.
+        if let completion = directNativeLoaders[adLoader] {
+            directNativeLoaders[adLoader] = nil
+            AppLogger.log("✅ native loaded (direct)")
+            completion(nativeAd)
+            return
+        }
         guard let (key, completion) = nativeLoaders[adLoader] else { return }
         nativeLoaders[adLoader] = nil
         nativeInFlight[key] = max(0, (nativeInFlight[key] ?? 1) - 1)
@@ -391,6 +423,12 @@ public final class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate
     }
 
     public func adLoader(_ adLoader: AdLoader, didFailToReceiveAdWithError error: Error) {
+        if let completion = directNativeLoaders[adLoader] {
+            directNativeLoaders[adLoader] = nil
+            AppLogger.log("❌ native failed (direct): \(error.localizedDescription)")
+            completion(nil)
+            return
+        }
         guard let (key, completion) = nativeLoaders[adLoader] else { return }
         nativeLoaders[adLoader] = nil
         nativeInFlight[key] = max(0, (nativeInFlight[key] ?? 1) - 1)
