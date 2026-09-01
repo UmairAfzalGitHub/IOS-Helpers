@@ -180,6 +180,22 @@ public final class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate
 
     // MARK: - Interstitial
 
+    /// Arms the frequency gate as if a gated interstitial had just been shown, so the
+    /// next `showInterstitial(respectFrequency: true)` is suppressed until
+    /// `interstitialMinInterval` elapses.
+    ///
+    /// Use this to give the user an untouched "explore" window after they land on the
+    /// home screen: one-shot interstitials (splash / first-launch, shown with
+    /// `respectFrequency: false`) never arm the gate, so without this the very first
+    /// tap on home would fire an interstitial immediately. Call it once when the home
+    /// screen appears. No-op for subscribed users. Pass `from` to override the start
+    /// point (defaults to now).
+    public func startInterstitialCooldown(from date: Date = Date()) {
+        guard !isSubscribedProvider() else { return }
+        lastInterstitialShownAt = date
+        AppLogger.log("⏳ interstitial cooldown started (\(interstitialMinInterval)s explore window)")
+    }
+
     public func isInterstitialReady(_ slot: AdSlot) -> Bool { interstitials[slot.key] != nil }
 
     public func preloadInterstitial(_ slot: AdSlot, completion: ((Bool) -> Void)? = nil) {
