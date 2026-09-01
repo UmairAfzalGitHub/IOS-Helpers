@@ -170,12 +170,20 @@ public final class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate
         return true
     }
 
+    /// A slot is "enabled" only when it has a non-empty ad-unit id. To disable a
+    /// placement temporarily (e.g. from Remote Config), have its `adUnitID` return
+    /// "" — every load/show below then skips it as a clean no-op: no ad request, no
+    /// failed-load noise, no impact on the unit's stats.
+    public func isEnabled(_ slot: AdSlot) -> Bool {
+        !slot.adUnitID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     // MARK: - Interstitial
 
     public func isInterstitialReady(_ slot: AdSlot) -> Bool { interstitials[slot.key] != nil }
 
     public func preloadInterstitial(_ slot: AdSlot, completion: ((Bool) -> Void)? = nil) {
-        guard expect(slot, .interstitial), !isSubscribedProvider() else { completion?(false); return }
+        guard expect(slot, .interstitial), isEnabled(slot), !isSubscribedProvider() else { completion?(false); return }
         if interstitials[slot.key] != nil { completion?(true); return }
         guard !loadingInterstitials.contains(slot.key) else { completion?(false); return }
         loadingInterstitials.insert(slot.key)
@@ -201,7 +209,7 @@ public final class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate
                                  from viewController: UIViewController? = nil,
                                  respectFrequency: Bool = true,
                                  completion: (() -> Void)? = nil) {
-        guard expect(slot, .interstitial), !isSubscribedProvider() else { completion?(); return }
+        guard expect(slot, .interstitial), isEnabled(slot), !isSubscribedProvider() else { completion?(); return }
 
         if respectFrequency, let last = lastInterstitialShownAt,
            Date().timeIntervalSince(last) < interstitialMinInterval {
@@ -244,7 +252,7 @@ public final class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate
     public func isRewardedReady(_ slot: AdSlot) -> Bool { rewardeds[slot.key] != nil }
 
     public func preloadRewarded(_ slot: AdSlot, completion: ((Bool) -> Void)? = nil) {
-        guard expect(slot, .rewarded), !isSubscribedProvider() else { completion?(false); return }
+        guard expect(slot, .rewarded), isEnabled(slot), !isSubscribedProvider() else { completion?(false); return }
         if rewardeds[slot.key] != nil { completion?(true); return }
         guard !loadingRewardeds.contains(slot.key) else { completion?(false); return }
         loadingRewardeds.insert(slot.key)
@@ -267,7 +275,7 @@ public final class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate
     public func showRewarded(_ slot: AdSlot,
                              from viewController: UIViewController,
                              completion: @escaping (Bool) -> Void) {
-        guard expect(slot, .rewarded), !isSubscribedProvider() else { completion(false); return }
+        guard expect(slot, .rewarded), isEnabled(slot), !isSubscribedProvider() else { completion(false); return }
         guard !isShowingAd, let ad = rewardeds[slot.key] else {
             AppLogger.log("❌ rewarded[\(slot.key)] not ready / busy")
             completion(false); return
@@ -290,7 +298,7 @@ public final class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate
     public func isAppOpenReady(_ slot: AdSlot) -> Bool { appOpens[slot.key] != nil }
 
     public func preloadAppOpen(_ slot: AdSlot, completion: ((Bool) -> Void)? = nil) {
-        guard expect(slot, .appOpen), !isSubscribedProvider() else { completion?(false); return }
+        guard expect(slot, .appOpen), isEnabled(slot), !isSubscribedProvider() else { completion?(false); return }
         if appOpens[slot.key] != nil { completion?(true); return }
         guard !loadingAppOpens.contains(slot.key) else { completion?(false); return }
         loadingAppOpens.insert(slot.key)
@@ -310,7 +318,7 @@ public final class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate
     public func showAppOpen(_ slot: AdSlot,
                             from viewController: UIViewController? = nil,
                             completion: (() -> Void)? = nil) {
-        guard expect(slot, .appOpen), !isSubscribedProvider() else { completion?(); return }
+        guard expect(slot, .appOpen), isEnabled(slot), !isSubscribedProvider() else { completion?(); return }
         guard !isShowingAd, let ad = appOpens[slot.key] else { completion?(); return }
         guard let presenter = viewController ?? UIApplication.shared.topViewController else { completion?(); return }
         appOpens[slot.key] = nil // consume
@@ -327,7 +335,7 @@ public final class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate
 
     /// Build a banner for a slot (adaptive inline). Caller owns layout.
     public func makeBanner(_ slot: AdSlot, rootViewController: UIViewController) -> BannerView? {
-        guard expect(slot, .banner), !isSubscribedProvider() else { return nil }
+        guard expect(slot, .banner), isEnabled(slot), !isSubscribedProvider() else { return nil }
         let size = currentOrientationInlineAdaptiveBanner(width: UIScreen.main.bounds.width)
         let banner = BannerView(adSize: size)
         banner.adUnitID = slot.adUnitID
@@ -340,7 +348,7 @@ public final class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate
     /// Load a banner for `slot` into an EXISTING banner view the caller already owns
     /// (e.g. one laid out in a xib). Sets its unit id / root and kicks off the load.
     public func loadBanner(_ slot: AdSlot, into bannerView: BannerView, rootViewController: UIViewController) {
-        guard expect(slot, .banner), !isSubscribedProvider() else { return }
+        guard expect(slot, .banner), isEnabled(slot), !isSubscribedProvider() else { return }
         bannerView.adUnitID = slot.adUnitID
         bannerView.rootViewController = rootViewController
         bannerView.load(Self.makeAdRequest(placement: slot.key))
@@ -374,7 +382,7 @@ public final class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate
                               count: Int = 1,
                               from viewController: UIViewController? = nil,
                               completion: ((NativeAd?) -> Void)? = nil) {
-        guard expect(slot, .native), !isSubscribedProvider() else { completion?(nil); return }
+        guard expect(slot, .native), isEnabled(slot), !isSubscribedProvider() else { completion?(nil); return }
         guard let root = viewController ?? UIApplication.shared.sceneWindow?.rootViewController else {
             completion?(nil); return
         }
@@ -397,7 +405,7 @@ public final class AdManager: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate
     public func loadNative(_ slot: AdSlot,
                            from viewController: UIViewController,
                            completion: @escaping (NativeAd?) -> Void) {
-        guard expect(slot, .native), !isSubscribedProvider() else { completion(nil); return }
+        guard expect(slot, .native), isEnabled(slot), !isSubscribedProvider() else { completion(nil); return }
         let loader = AdLoader(adUnitID: slot.adUnitID, rootViewController: viewController, adTypes: [.native], options: nil)
         loader.delegate = self
         directNativeLoaders[loader] = completion
